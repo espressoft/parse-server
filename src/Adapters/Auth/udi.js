@@ -1,44 +1,103 @@
-// Helper functions for accessing the UDI API.
-var https = require('https');
-var Parse = require('parse/node').Parse;
+/ Apple SignIn Auth
+// https://developer.apple.com/documentation/signinwithapplerestapi
 
-function validateIdToken(id, token) {
-  return request("tokeninfo?id_token=" + token)
-    .then((response) => {
-      if (response && (response.sub == id || response.user_id == id)) {
-        return;
-      }
-      throw new Parse.Error(
-        Parse.Error.OBJECT_NOT_FOUND,
-        'Google auth is invalid for this user.');
-    });
-}
+const Parse = require('parse/node').Parse;
+const jwksClient = require('jwks-rsa');
+const util = require('util');
+const jwt = require('jsonwebtoken');
 
-function validateAuthToken(id, token) {
-  return request("tokeninfo?access_token=" + token)
-    .then((response) => {
-      if (response &&  (response.sub == id || response.user_id == id)) {
-        return;
-      }
-      throw new Parse.Error(
-        Parse.Error.OBJECT_NOT_FOUND,
-        'Google auth is invalid for this user.');
-    });
-}
+const TOKEN_ISSUER = 'https://appleid.apple.com';
 
-// Returns a promise that fulfills if this user id is valid.
-function validateAuthData(authData) {
-  if (authData.id_token) {
-    return validateIdToken(authData.id, authData.id_token);
-  } else {
-    return validateAuthToken(authData.id, authData.access_token).then(() => {
-      // Validation with auth token worked
-      return;
-    }, () => {
-      // Try with the id_token param
-      return validateIdToken(authData.id, authData.access_token);
-    });
+const getAppleKeyByKeyId = async (keyId, cacheMaxEntries, cacheMaxAge) => {
+  const client = jwksClient({
+    jwksUri: `${TOKEN_ISSUER}/auth/keys`,
+    cache: true,
+    cacheMaxEntries,
+    cacheMaxAge,
+  });
+
+  const asyncGetSigningKeyFunction = util.promisify(client.getSigningKey);
+
+  let key;
+  try {
+    key = await asyncGetSigningKeyFunction(keyId);
+  } catch (error) {
+    throw new Parse.Error(
+      Parse.Error.OBJECT_NOT_FOUND,
+      `Unable to find matching key for Key ID: ${keyId}`
+    );
   }
+  return key;
+};
+
+const getHeaderFromToken = token => {
+  const decodedToken = jwt.decode(token, { complete: true });
+  if (!decodedToken) {
+    throw new Parse.Error(
+      Parse.Error.OBJECT_NOT_FOUND,
+      `provided token does not decode as JWT`
+    );
+  }
+
+  return decodedToken.header;
+};
+
+const verifyIdToken = async (
+  { token, id },
+  { clientId, cacheMaxEntries, cacheMaxAge }
+) => {
+  if (!token) {
+    throw new Parse.Error(
+      Parse.Error.OBJECT_NOT_FOUND,
+      `id token is invalid for this user.`
+    );
+  }
+
+  const { kid: keyId, alg: algorithm } = getHeaderFromToken(token);
+  const ONE_HOUR_IN_MS = 3600000;
+  let jwtClaims;
+
+  cacheMaxAge = cacheMaxAge || ONE_HOUR_IN_MS;
+  cacheMaxEntries = cacheMaxEntries || 5;
+
+  const appleKey = await getAppleKeyByKeyId(
+    keyId,
+    cacheMaxEntries,
+    cacheMaxAge
+  );
+  const signingKey = appleKey.publicKey || appleKey.rsaPublicKey;
+
+  try {
+    jwtClaims = jwt.verify(token, signingKey, {
+      algorithms: algorithm,
+      // the audience can be checked against a string, a regular expression or a list of strings and/or regular expressions.
+      audience: clientId,
+    });
+  } catch (exception) {
+    const message = exception.message;
+
+    throw new Parse.Error(Parse.Error.OBJECT_NOT_FOUND, `${message}`);
+  }
+
+  if (jwtClaims.iss !== TOKEN_ISSUER) {
+    throw new Parse.Error(
+      Parse.Error.OBJECT_NOT_FOUND,
+      `id token not issued by correct OpenID provider - expected: ${TOKEN_ISSUER} | from: ${jwtClaims.iss}`
+    );
+  }
+
+  if (jwtClaims.sub !== id) {
+    throw new Parse.Error(
+      Parse.Error.OBJECT_NOT_FOUND,
+      `auth data is invalid for this user.`
+    );
+  }
+  return jwtClaims;
+};
+
+// Returns a promise that fulfills if this id token is valid
+function validateAuthData(authData, options = {}) {
+  return verifyIdToken(authData, options);
 }
 
 // Returns a promise that fulfills if this app id is valid.
@@ -46,29 +105,7 @@ function validateAppId() {
   return Promise.resolve();
 }
 
-// A promisey wrapper for api requests
-function request(path) {
-  return new Promise(function(resolve, reject) {
-    https.get("https://www.googleapis.com/oauth2/v3/" + path, function(res) {
-      var data = '';
-      res.on('data', function(chunk) {
-        data += chunk;
-      });
-      res.on('end', function() {
-        try {
-          data = JSON.parse(data);
-        } catch(e) {
-          return reject(e);
-        }
-        resolve(data);
-      });
-    }).on('error', function() {
-      reject('Failed to validate this access token with Google.');
-    });
-  });
-}
-
 module.exports = {
-  validateAppId: validateAppId,
-  validateAuthData: validateAuthData
+  validateAppId,
+  validateAuthData,
 };
