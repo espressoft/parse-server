@@ -1,4 +1,4 @@
-/ Apple SignIn Auth
+// Apple SignIn Auth
 // https://developer.apple.com/documentation/signinwithapplerestapi
 
 const Parse = require('parse/node').Parse;
